@@ -10,7 +10,7 @@ ROOT=Path(__file__).parent
 DB=ROOT/"data.sqlite"
 SPORTS=("football","basketball","cricket","tennis")
 BOOKMAKERS=["CSGOEmpire","Whale.io","HugoBet","Locas.bet","BK8.io","BetUS","10bet","MelBet"]
-BASE="https://sportscore.com/api/v1/fixtures/"
+BASE="https://sportscore.com/api/widget/matches/"
 
 def now():
  return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -49,9 +49,10 @@ def extract_items(payload):
 def is_live(item):
  raw=first(item.get("status"),item.get("status_text"),item.get("state"),nested(item,"status","short"),nested(item,"status","name"))
  if isinstance(raw,dict):raw=first(raw.get("short"),raw.get("name"),raw.get("type"))
- if raw is None or raw=="":return True # API request itself is filtered to status=live
+ if raw is None or raw=="":return False
  s=norm(raw)
- return s in {"live","inplay","in play","in progress","1h","2h","ht","half time","q1","q2","q3","q4","period 1","period 2","period 3","period 4","set 1","set 2","set 3","set 4","set 5","overtime","ot","playing","in progress live"}
+ if s in {"live","inplay","in play","in progress","inprogress","playing","1h","2h","ht","half time","q1","q2","q3","q4","period 1","period 2","period 3","period 4","set 1","set 2","set 3","set 4","set 5","overtime","ot","1st half","2nd half","first half","second half"}:return True
+ return bool(re.search(r"\b\d{1,3}\s*(?:min|mins|minute|minutes)\b|\b\d{1,3}\s*['’]",str(raw),re.I))
 def score_value(item,side):
  keys=(side+"_score",side+"Score","score_"+side)
  val=first(*(item.get(k) for k in keys),nested(item,"scores",side),nested(item,"score",side))
@@ -80,14 +81,16 @@ class Monitor:
    for sport in SPORTS:
     if self.stop_event.is_set():break
     try:
-     # The documented v1 fixtures endpoint supports status=live and up to 200 fixtures.
-     response=client.get(BASE,params={"sport":sport,"date":datetime.now(timezone.utc).date().isoformat(),"status":"live","limit":200})
+     # Official documented live + recent feed, up to 50 records per sport.
+     # Filter to active statuses locally; this feed can also contain recently finished matches.
+     response=client.get(BASE,params={"sport":sport,"limit":50})
      response.raise_for_status()
      payload=response.json()
      items=extract_items(payload)
      updated=first(payload.get("updated"),payload.get("generated_at"),payload.get("last_updated")) if isinstance(payload,dict) else None
      with self.lock:
-      self.provider_states[sport]={"state":"Данные доступны","detail":f"Получено событий: {len(items)}","checked_at":now()}
+      live_count=sum(1 for item in items if isinstance(item,dict) and is_live(item))
+      self.provider_states[sport]={"state":"Данные доступны","detail":f"Получено записей: {len(items)}, LIVE: {live_count}","checked_at":now()}
       target=self.target
       for item in items:
        if not isinstance(item,dict) or not is_live(item) or not self.matches_target(item,target):continue
