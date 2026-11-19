@@ -47,7 +47,7 @@ def extract_items(payload):
     if isinstance(value.get(subkey),list):return value[subkey]
  return []
 def is_live(item):
- raw=first(item.get("status"),item.get("status_text"),item.get("state"),nested(item,"status","short"),nested(item,"status","name"))
+ raw=first(item.get("status_text"),item.get("status"),item.get("state"),nested(item,"status","short"),nested(item,"status","name"))
  if isinstance(raw,dict):raw=first(raw.get("short"),raw.get("name"),raw.get("type"))
  if raw is None or raw=="":return False
  s=norm(raw)
