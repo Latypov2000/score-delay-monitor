@@ -35,10 +35,6 @@ class Monitor:
       target=self.target
       for item in items:
        if not isinstance(item,dict) or not self.matches_target(item,target):continue
-       # Strict live-only guard: never show scheduled/upcoming or finished fixtures.
-       raw_status=str(item.get("status") or item.get("status_text") or "").strip().casefold()
-       if raw_status not in {"live","inplay","in_play","in progress","in_progress","1h","2h","ht","half time","q1","q2","q3","q4","period 1","period 2","period 3","period 4","set 1","set 2","set 3","set 4","set 5","overtime","ot"}:
-        continue
        home=str(item.get("home") or "");away=str(item.get("away") or "")
        hs=item.get("home_score");ascore=item.get("away_score")
        score=f"{hs if hs is not None else '—'} : {ascore if ascore is not None else '—'}"
