@@ -1,7 +1,7 @@
 import asyncio,csv,io,re,sqlite3,threading,time
 from datetime import datetime,timezone
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import async_playwright
@@ -31,7 +31,7 @@ class Monitor:
  def __init__(self):
   init()
   self.running=False;self.thread=None;self.loop=None;self.stop_event=None
-  self.lock=threading.Lock();self.events=[];self.seen={};self.started=None;self.error=None
+  self.lock=threading.Lock();self.events=[];self.seen={};self.started=None;self.error=None;self.target=""
  def status(self,n,s,d):
   with sqlite3.connect(DB) as c:
    c.execute("INSERT OR REPLACE INTO statuses VALUES(?,?,?,?)",(n,s,d,ts()))
