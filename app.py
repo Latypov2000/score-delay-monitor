@@ -1,138 +1,68 @@
-import asyncio,csv,io,json,os,re,sqlite3,threading,time
+import csv,io,re,sqlite3,threading
 from datetime import datetime,timezone
 from pathlib import Path
-from urllib.parse import urlencode
-import httpx,websockets
+import httpx
 from fastapi import FastAPI,Request
 from fastapi.responses import HTMLResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 ROOT=Path(__file__).parent
 DB=ROOT/"data.sqlite"
-API="https://api.pulsescore.net"
-SPORTS=("soccer","tennis","ice-hockey")
-TARGETS=["CSGOEmpire","Whale.io","HugoBet","Locas.bet","BK8.io","BetUS","10bet","MelBet"]
-# Provider identifiers are confirmed only for these two until capability lookup verifies more.
-ALIASES={"10bet":"10bet","melbet":"melbet"}
-DISPLAY={"10bet":"10bet","melbet":"MelBet"}
-def now():return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-def init():
- with sqlite3.connect(DB) as c:
-  c.execute("CREATE TABLE IF NOT EXISTS obs(id INTEGER PRIMARY KEY,site TEXT,url TEXT,ts TEXT,score TEXT,context TEXT,source TEXT)")
-  c.execute("CREATE TABLE IF NOT EXISTS statuses(site TEXT PRIMARY KEY,state TEXT,detail TEXT,ts TEXT)")
+SPORTS=("football","basketball","cricket","tennis")
+BOOKMAKERS=["CSGOEmpire","Whale.io","HugoBet","Locas.bet","BK8.io","BetUS","10bet","MelBet"]
+BASE="https://sportscore.com/api/widget/matches/"
+def now(): return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+def norm(s): return re.sub(r"[^a-z0-9]+"," ",str(s or "").casefold()).strip()
+def init_db():
+ with sqlite3.connect(DB) as c: c.execute("CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY,sport TEXT,match TEXT,score TEXT,status TEXT,observed_at TEXT,provider_updated TEXT)")
 class Monitor:
  def __init__(self):
-  init();self.running=False;self.thread=None;self.loop=None;self.stop_event=None
-  self.lock=threading.RLock();self.target="";self.events=[];self.seen={};self.started=None;self.error=None;self.last_frame=None;self.connection_state="Остановлен";self.boards={}
+  init_db();self.lock=threading.RLock();self.target="";self.thread=None;self.stop_event=threading.Event();self.last_poll=None;self.error=None;self.matches=[];self.provider_states={};self.last_scores={}
  def set_target(self,target):
-  with self.lock:self.target=target[:160];self.events=[];self.seen={}
- def status(self,n,state,detail):
-  with sqlite3.connect(DB) as c:c.execute("INSERT OR REPLACE INTO statuses VALUES(?,?,?,?)",(n,state,detail[:240],now()))
- def score(self,e):
-  s=e.get("score")
-  if isinstance(s,dict):
-   h=s.get("home",s.get("homeScore"));a=s.get("away",s.get("awayScore"))
-   if h is not None and a is not None:return f"{h}-{a}"
-  if isinstance(s,(str,int,float)):return str(s)
-  return ""
- def match_ok(self,e,target):
-  home=str(e.get("home") or e.get("homeTeam") or "")
-  away=str(e.get("away") or e.get("awayTeam") or "")
-  hay=(home+" "+away).casefold()
-  words=[x.casefold() for x in re.findall(r"[\w]+",target,flags=re.UNICODE) if len(x)>1 and x.casefold() not in {"vs","versus","против"}]
-  return bool(words) and all(x in hay for x in words)
- def save_event(self,book,sport,e):
-  with self.lock:target=self.target
-  if not target or not self.match_ok(e,target):return
-  score=self.score(e)
-  if not score:return
-  site=DISPLAY.get(book,book)
-  home=str(e.get("home") or e.get("homeTeam") or "")
-  away=str(e.get("away") or e.get("awayTeam") or "")
-  fixture=f"{home} — {away}";stamp=now();key=(site,fixture.casefold(),score)
+  with self.lock:self.target=target[:160];self.matches=[];self.last_scores={}
+ def matches_target(self,item,target):
+  q=norm(target);hay=norm(str(item.get("home") or "")+" "+str(item.get("away") or ""))
+  words=[w for w in q.split() if len(w)>1 and w not in ("vs","versus")]
+  return bool(words) and all(w in hay for w in words)
+ def poll_once(self):
+  with httpx.Client(timeout=15,headers={"Accept":"application/json","User-Agent":"ScoreDelayMonitor/1.0"}) as client:
+   for sport in SPORTS:
+    if self.stop_event.is_set():break
+    try:
+     r=client.get(BASE,params={"sport":sport,"limit":50});r.raise_for_status();payload=r.json()
+     items=payload.get("matches",[]);updated=payload.get("updated")
+     with self.lock:
+      self.provider_states[sport]={"state":"Данные доступны","detail":f"Получено матчей: {len(items)}","checked_at":now()}
+      target=self.target
+      for item in items:
+       if not isinstance(item,dict) or not self.matches_target(item,target):continue
+       home=str(item.get("home") or "");away=str(item.get("away") or "")
+       hs=item.get("home_score");ascore=item.get("away_score")
+       score=f"{hs if hs is not None else '—'} : {ascore if ascore is not None else '—'}"
+       fixture=f"{home} — {away}";key=(sport,fixture.casefold())
+       if self.last_scores.get(key)==score:continue
+       stamp=now();self.last_scores[key]=score
+       row={"sport":sport,"match":fixture,"score":score,"status":str(item.get("status_text") or item.get("status") or ""),"observed_at":stamp,"provider_updated":updated,"source":"SportScore"}
+       self.matches.insert(0,row);self.matches=self.matches[:100]
+       with sqlite3.connect(DB) as db:db.execute("INSERT INTO observations(sport,match,score,status,observed_at,provider_updated) VALUES(?,?,?,?,?,?)",(sport,fixture,score,row["status"],stamp,str(updated or "")))
+    except Exception as e:
+     with self.lock:self.provider_states[sport]={"state":"Ошибка источника","detail":f"{type(e).__name__}: {str(e)[:160]}","checked_at":now()}
   with self.lock:
-   if key in self.seen:return
-   self.seen[key]=stamp
-   self.events.insert(0,{"site":site,"url":"","observed_utc":stamp,"score":score,"context":sport+" · "+str(e.get("league") or ""),"source":"PulseScore Stream","match":fixture})
-   self.events=self.events[:500]
-  with sqlite3.connect(DB) as c:c.execute("INSERT INTO obs(site,url,ts,score,context,source) VALUES(?,?,?,?,?,?)",(site,"",stamp,score,sport+" · "+str(e.get("league") or ""),"PulseScore Stream"))
-  self.status(site,"Матч найден",fixture+" · "+score)
- def process_frame(self,frame):
-  typ=frame.get("t");stream=str(frame.get("stream",""));parts=stream.split("/")
-  if len(parts)!=3:return
-  book,kind,sport=parts
-  if kind!="live" or sport not in SPORTS:return
-  board=self.boards.setdefault(stream,{})
-  if typ=="snapshot":
-   for e in frame.get("events") or []:
-    if isinstance(e,dict):
-     eid=str(e.get("id") or e.get("eventId") or "")
-     if eid:board[eid]=e
-     self.save_event(book,sport,e)
-   return
-  if typ=="delta":
-   for change in frame.get("changes") or []:
-    op=change.get("op");eid=str(change.get("eventId") or "")
-    if op=="upsert" and isinstance(change.get("event"),dict):
-     e=change["event"];board[eid]=e;self.save_event(book,sport,e)
-    elif op=="patch" and eid in board:
-     e=board[eid];e.update(change.get("set") or {})
-     # Selection/market deltas do not necessarily affect score.
-     self.save_event(book,sport,e)
-  elif typ=="snapshot_end":self.last_frame=now()
- async def run_stream(self):
-  key=os.getenv("PULSESCORE_API_KEY","").strip()
-  if not key:
-   self.error="Не задан PULSESCORE_API_KEY в Render → Environment"
-   for n in TARGETS:self.status(n,"Требуется ключ","Добавь API-ключ PulseScore")
-   return
-  params=urlencode({"key":key,"bookmakers":"all","sports":",".join(SPORTS),"kinds":"live"})
-  uri="wss://api.pulsescore.net/api/stream/ws?"+params
-  delay=2
+   self.last_poll=now()
+   self.error=None if any(v["state"]=="Данные доступны" for v in self.provider_states.values()) else "Бесплатный источник недоступен"
+ def run(self):
   while not self.stop_event.is_set():
-   try:
-    self.connection_state="Подключение к PulseScore"
-    async with websockets.connect(uri,ping_interval=30,ping_timeout=150,max_size=None,max_queue=256,close_timeout=5) as ws:
-     self.connection_state="Поток подключён";delay=2;self.error=None
-     async for raw in ws:
-      if self.stop_event.is_set():break
-      try:frame=json.loads(raw)
-      except Exception:continue
-      typ=frame.get("t")
-      if typ=="error":
-       self.error=str(frame.get("message") or frame);continue
-      if typ=="connected":
-       self.connection_state="Подключён · "+str(frame.get("plan",""))
-       for n in TARGETS:self.status(n,"Поток подключён","Ожидаем live-данные; покрытие проверяется по входящим потокам")
-      elif typ in ("snapshot","delta","snapshot_end"):self.process_frame(frame)
-   except Exception as ex:
-    self.connection_state="Переподключение";self.error=f"{type(ex).__name__}: {str(ex)[:180]}"
-    for n in TARGETS:self.status(n,"Переподключение",self.error)
-    try:await asyncio.wait_for(self.stop_event.wait(),timeout=delay)
-    except asyncio.TimeoutError:pass
-    delay=min(delay*2,60)
-  self.connection_state="Остановлен"
- async def runner(self):
-  self.loop=asyncio.get_running_loop()
-  await self.run_stream()
+   self.poll_once()
+   # Provider edge cache is about 60 seconds; polling more often does not improve freshness.
+   self.stop_event.wait(60)
  def start(self):
-  if self.running or (self.thread and self.thread.is_alive()):return
-  self.running=True;self.started=now();self.error=None;self.stop_event=asyncio.Event()
-  def worker():
-   try:asyncio.run(self.runner())
-   finally:self.running=False
-  self.thread=threading.Thread(target=worker,daemon=True);self.thread.start()
- def stop(self):
-  if self.loop and self.stop_event:self.loop.call_soon_threadsafe(self.stop_event.set)
+  if self.thread and self.thread.is_alive():return
+  self.stop_event.clear();self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start()
+ def stop(self):self.stop_event.set()
  def state(self):
-  with sqlite3.connect(DB) as c:
-   c.row_factory=sqlite3.Row
-   statuses=[dict(x) for x in c.execute("SELECT * FROM statuses ORDER BY site")]
-   history=[dict(x) for x in c.execute("SELECT site,url,ts observed_utc,score,context,source FROM obs ORDER BY id DESC LIMIT 300")]
-  with self.lock:
-   return {"running":self.running,"started":self.started,"error":self.error,"target":self.target,"last_poll":self.last_frame,"api_configured":bool(os.getenv("PULSESCORE_API_KEY","").strip()),"connection_state":self.connection_state,"sites":[{"name":n,"provider":ALIASES.get(n)} for n in TARGETS],"statuses":statuses,"events":list(self.events) or history}
+  with self.lock:return {"running":bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set()),"target":self.target,"last_poll":self.last_poll,"error":self.error,"provider":"SportScore","provider_states":dict(self.provider_states),"matches":list(self.matches),"bookmakers":[{"name":n,"state":"Нет прямого источника","detail":"Общий спортивный счёт не является данными этой букмекерской конторы."} for n in BOOKMAKERS]}
 m=Monitor();app=FastAPI(title="Score Delay Monitor");app.mount("/static",StaticFiles(directory=ROOT/"static"),name="static")
 @app.get("/",response_class=HTMLResponse)
-def home():return (ROOT/"static/index.html").read_text()
+def home():return (ROOT/"static/index.html").read_text(encoding="utf-8")
 @app.get("/api/state")
 def state():return m.state()
 @app.post("/api/start")
@@ -141,9 +71,9 @@ def start():m.start();return {"ok":True}
 def stop():m.stop();return {"ok":True}
 @app.post("/api/match")
 async def match(request:Request):
- data=await request.json();target=str(data.get("target","")).strip()[:160];m.set_target(target);return {"ok":True,"target":target}
+ d=await request.json();target=str(d.get("target","")).strip()[:160];m.set_target(target);return {"ok":True,"target":target}
 @app.get("/api/export")
 def export():
- with sqlite3.connect(DB) as c:rows=c.execute("SELECT site,url,ts,score,context,source FROM obs ORDER BY id").fetchall()
- out=io.StringIO();w=csv.writer(out);w.writerow(["site","url","observed_utc","score","context","source"]);w.writerows(rows)
+ with sqlite3.connect(DB) as db:rows=db.execute("SELECT sport,match,score,status,observed_at,provider_updated FROM observations ORDER BY id DESC LIMIT 5000").fetchall()
+ out=io.StringIO();w=csv.writer(out);w.writerow(["sport","match","score","status","observed_at_utc","provider_updated"]);w.writerows(rows)
  return StreamingResponse(io.BytesIO(out.getvalue().encode("utf-8-sig")),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=score-monitor.csv"})
