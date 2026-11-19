@@ -6,16 +6,15 @@ import httpx,websockets
 from fastapi import FastAPI,Request
 from fastapi.responses import HTMLResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
-
 ROOT=Path(__file__).parent
 DB=ROOT/"data.sqlite"
 API="https://api.pulsescore.net"
 SPORTS=("soccer","tennis","ice-hockey")
-# Target names are mapped only where the aggregator's catalogue confirms coverage.
+TARGETS=["CSGOEmpire","Whale.io","HugoBet","Locas.bet","BK8.io","BetUS","10bet","MelBet"]
+# Provider identifiers are confirmed only for these two until capability lookup verifies more.
 ALIASES={"10bet":"10bet","melbet":"melbet"}
 DISPLAY={"10bet":"10bet","melbet":"MelBet"}
-TARGETS=["CSGOEmpire","Whale.io","HugoBet","Locas.bet","BK8.io","BetUS","10bet","MelBet"]
-def now(): return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+def now():return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 def init():
  with sqlite3.connect(DB) as c:
   c.execute("CREATE TABLE IF NOT EXISTS obs(id INTEGER PRIMARY KEY,site TEXT,url TEXT,ts TEXT,score TEXT,context TEXT,source TEXT)")
@@ -23,7 +22,7 @@ def init():
 class Monitor:
  def __init__(self):
   init();self.running=False;self.thread=None;self.loop=None;self.stop_event=None
-  self.lock=threading.RLock();self.target="";self.events=[];self.seen={};self.started=None;self.error=None;self.last_frame=None;self.connection_state="Остановлен"
+  self.lock=threading.RLock();self.target="";self.events=[];self.seen={};self.started=None;self.error=None;self.last_frame=None;self.connection_state="Остановлен";self.boards={}
  def set_target(self,target):
   with self.lock:self.target=target[:160];self.events=[];self.seen={}
  def status(self,n,state,detail):
@@ -49,8 +48,7 @@ class Monitor:
   site=DISPLAY.get(book,book)
   home=str(e.get("home") or e.get("homeTeam") or "")
   away=str(e.get("away") or e.get("awayTeam") or "")
-  fixture=f"{home} — {away}"
-  stamp=now();key=(site,fixture.casefold(),score)
+  fixture=f"{home} — {away}";stamp=now();key=(site,fixture.casefold(),score)
   with self.lock:
    if key in self.seen:return
    self.seen[key]=stamp
@@ -58,6 +56,29 @@ class Monitor:
    self.events=self.events[:500]
   with sqlite3.connect(DB) as c:c.execute("INSERT INTO obs(site,url,ts,score,context,source) VALUES(?,?,?,?,?,?)",(site,"",stamp,score,sport+" · "+str(e.get("league") or ""),"PulseScore Stream"))
   self.status(site,"Матч найден",fixture+" · "+score)
+ def process_frame(self,frame):
+  typ=frame.get("t");stream=str(frame.get("stream",""));parts=stream.split("/")
+  if len(parts)!=3:return
+  book,kind,sport=parts
+  if kind!="live" or sport not in SPORTS:return
+  board=self.boards.setdefault(stream,{})
+  if typ=="snapshot":
+   for e in frame.get("events") or []:
+    if isinstance(e,dict):
+     eid=str(e.get("id") or e.get("eventId") or "")
+     if eid:board[eid]=e
+     self.save_event(book,sport,e)
+   return
+  if typ=="delta":
+   for change in frame.get("changes") or []:
+    op=change.get("op");eid=str(change.get("eventId") or "")
+    if op=="upsert" and isinstance(change.get("event"),dict):
+     e=change["event"];board[eid]=e;self.save_event(book,sport,e)
+    elif op=="patch" and eid in board:
+     e=board[eid];e.update(change.get("set") or {})
+     # Selection/market deltas do not necessarily affect score.
+     self.save_event(book,sport,e)
+  elif typ=="snapshot_end":self.last_frame=now()
  async def run_stream(self):
   key=os.getenv("PULSESCORE_API_KEY","").strip()
   if not key:
@@ -70,58 +91,32 @@ class Monitor:
   while not self.stop_event.is_set():
    try:
     self.connection_state="Подключение к PulseScore"
-    for n in TARGETS:self.status(n,"Подключение","Ожидаем поток PulseScore")
     async with websockets.connect(uri,ping_interval=30,ping_timeout=150,max_size=None,max_queue=256,close_timeout=5) as ws:
-     self.connection_state="Поток подключён";delay=2
-     for n in TARGETS:self.status(n,"Поток подключён","Получаем live-события")
+     self.connection_state="Поток подключён";delay=2;self.error=None
      async for raw in ws:
       if self.stop_event.is_set():break
       try:frame=json.loads(raw)
       except Exception:continue
       typ=frame.get("t")
       if typ=="error":
-       self.error=str(frame.get("message") or frame)
-       continue
+       self.error=str(frame.get("message") or frame);continue
       if typ=="connected":
-       self.connection_state="Подключён · "+str(frame.get("plan",""));continue
-      if typ in ("snapshot","delta"):
-       stream=str(frame.get("stream",""));parts=stream.split("/")
-       if len(parts)!=3:continue
-       book,kind,sport=parts
-       if kind!="live" or sport not in SPORTS:continue
-       if typ=="snapshot":
-        events=frame.get("events") or []
-        for e in events:
-         if isinstance(e,dict):self.save_event(book,sport,e)
-       else:
-        for change in frame.get("changes") or []:
-         if change.get("op")=="upsert" and isinstance(change.get("event"),dict):self.save_event(book,sport,change["event"])
-         elif change.get("op")=="patch":
-          # Delta patches are applied to the last known event snapshot in memory.
-          event_id=str(change.get("eventId"))
-          board=self.boards.get(stream,{})
-          e=board.get(event_id)
-          if e:
-           e.update(change.get("set") or {})
-           if "score" in e:self.save_event(book,sport,e)
-       elif typ=="snapshot_end":
-        self.last_frame=now()
-      elif typ=="snapshot_end":self.last_frame=now()
+       self.connection_state="Подключён · "+str(frame.get("plan",""))
+       for n in TARGETS:self.status(n,"Поток подключён","Ожидаем live-данные; покрытие проверяется по входящим потокам")
+      elif typ in ("snapshot","delta","snapshot_end"):self.process_frame(frame)
    except Exception as ex:
-    self.connection_state="Переподключение"
-    self.error=f"{type(ex).__name__}: {str(ex)[:180]}"
+    self.connection_state="Переподключение";self.error=f"{type(ex).__name__}: {str(ex)[:180]}"
     for n in TARGETS:self.status(n,"Переподключение",self.error)
     try:await asyncio.wait_for(self.stop_event.wait(),timeout=delay)
     except asyncio.TimeoutError:pass
     delay=min(delay*2,60)
   self.connection_state="Остановлен"
  async def runner(self):
-  self.boards={}
+  self.loop=asyncio.get_running_loop()
   await self.run_stream()
  def start(self):
   if self.running or (self.thread and self.thread.is_alive()):return
-  self.running=True;self.started=now();self.error=None
-  self.stop_event=asyncio.Event()
+  self.running=True;self.started=now();self.error=None;self.stop_event=asyncio.Event()
   def worker():
    try:asyncio.run(self.runner())
    finally:self.running=False
@@ -135,9 +130,7 @@ class Monitor:
    history=[dict(x) for x in c.execute("SELECT site,url,ts observed_utc,score,context,source FROM obs ORDER BY id DESC LIMIT 300")]
   with self.lock:
    return {"running":self.running,"started":self.started,"error":self.error,"target":self.target,"last_poll":self.last_frame,"api_configured":bool(os.getenv("PULSESCORE_API_KEY","").strip()),"connection_state":self.connection_state,"sites":[{"name":n,"provider":ALIASES.get(n)} for n in TARGETS],"statuses":statuses,"events":list(self.events) or history}
-m=Monitor()
-app=FastAPI(title="Score Delay Monitor")
-app.mount("/static",StaticFiles(directory=ROOT/"static"),name="static")
+m=Monitor();app=FastAPI(title="Score Delay Monitor");app.mount("/static",StaticFiles(directory=ROOT/"static"),name="static")
 @app.get("/",response_class=HTMLResponse)
 def home():return (ROOT/"static/index.html").read_text()
 @app.get("/api/state")
