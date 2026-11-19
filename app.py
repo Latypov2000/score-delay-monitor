@@ -9,7 +9,7 @@ ROOT=Path(__file__).parent
 DB=ROOT/"data.sqlite"
 SPORTS=("football","basketball","cricket","tennis")
 BOOKMAKERS=["CSGOEmpire","Whale.io","HugoBet","Locas.bet","BK8.io","BetUS","10bet","MelBet"]
-BASE="https://sportscore.com/api/widget/matches/"
+BASE="https://sportscore.com/api/v1/fixtures/"
 def now(): return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 def norm(s): return re.sub(r"[^a-z0-9]+"," ",str(s or "").casefold()).strip()
 def init_db():
@@ -28,13 +28,17 @@ class Monitor:
    for sport in SPORTS:
     if self.stop_event.is_set():break
     try:
-     r=client.get(BASE,params={"sport":sport,"limit":50});r.raise_for_status();payload=r.json()
-     items=payload.get("matches",[]);updated=payload.get("updated")
+     r=client.get(BASE,params={"sport":sport,"status":"live","limit":200});r.raise_for_status();payload=r.json()
+     items=payload.get("matches",payload.get("fixtures",[]));updated=payload.get("updated")
      with self.lock:
-      self.provider_states[sport]={"state":"Данные доступны","detail":f"Получено матчей: {len(items)}","checked_at":now()}
+      self.provider_states[sport]={"state":"Данные доступны","detail":f"Получено live-матчей: {len(items)}","checked_at":now()}
       target=self.target
       for item in items:
        if not isinstance(item,dict) or not self.matches_target(item,target):continue
+       # Strict live-only guard: never show scheduled/upcoming or finished fixtures.
+       raw_status=str(item.get("status") or item.get("status_text") or "").strip().casefold()
+       if raw_status not in {"live","inplay","in_play","in progress","in_progress","1h","2h","ht","half time","q1","q2","q3","q4","period 1","period 2","period 3","period 4","set 1","set 2","set 3","set 4","set 5","overtime","ot"}:
+        continue
        home=str(item.get("home") or "");away=str(item.get("away") or "")
        hs=item.get("home_score");ascore=item.get("away_score")
        score=f"{hs if hs is not None else '—'} : {ascore if ascore is not None else '—'}"
