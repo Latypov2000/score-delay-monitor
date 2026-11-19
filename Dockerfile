@@ -1,7 +1,7 @@
-FROM mcr.microsoft.com/playwright/python:v1.51.0-noble
+FROM python:3.12-slim
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-ENV PYTHONUNBUFFERED=1
 CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
